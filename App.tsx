@@ -7,19 +7,22 @@ import {
   Alert, 
   FlatList, 
   PermissionsAndroid, 
-  Platform 
+  Platform, 
+  TextInput
 } from "react-native";
-import { BleManager } from "react-native-ble-plx";
+import { BleManager, Device as BLEDevice, Characteristic } from "react-native-ble-plx";
 import BLEAdvertiser from 'react-native-ble-advertiser';
 
 const bleManager = new BleManager();
 const SERVICE_UUID = "9800";
+const CHARACTERISTIC_UUID = "9801"; // Add characteristic UUID for data transfer
 const APP_ID = "8fb049f3-72dc-4af9-91ab-939a3af21cf5";
 
 type Device = {
   id: string;
   name?: string;
   rssi?: number;
+  bleDevice?: BLEDevice; // Store the actual BLE device for communication
 };
 
 export default function App() {
@@ -28,14 +31,14 @@ export default function App() {
   const [discoveredDevices, setDiscoveredDevices] = useState<Device[]>([]);
   const [connectedDevices, setConnectedDevices] = useState<Device[]>([]);
   const scanTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [_data, setData] = useState<string>('hello');
 
   const name1 = "Yash Phone";
   const name2 = "Jay Phone";
 
   const encoded = new TextEncoder().encode(name1);
   const encoded2 = new TextEncoder().encode(name2);
-  // console.log('Encoded Name 1:', encoded);
-  // console.log('Encoded Name 2:', encoded2);
+
   useEffect(() => {
     initializeApp();
     
@@ -101,17 +104,20 @@ export default function App() {
       // Set company ID
       BLEAdvertiser.setCompanyId(1234);
       
-      // Start broadcasting with minimal data to avoid 31-byte limit
+      // // Convert data to bytes for broadcasting
+      // const dataToSend = _data ? _data.slice(0, 15) : 'hello';
+      // const dataBytes = new TextEncoder().encode(dataToSend);
+      
+      // Start broadcasting with data
       await BLEAdvertiser.broadcast(
         APP_ID,
-        [0x01, 0x02], // Reduced data size
+        [0x01, 0x02],
         {
-          
-        }
+
+        } // Example manufacturer data
       );
       
       setIsBroadcasting(true);
-      console.log('Broadcasting started successfully');
     } catch (error) {
       console.error('Error starting broadcast:', error);
       Alert.alert('Broadcast Error', `Failed to start broadcasting: ${error.message}`);
@@ -144,9 +150,10 @@ export default function App() {
           setIsScanning(false);
           return;
         }
-        console.log('Discovered device:', device);
+        
         if (device) {
           console.log('Found device:', device.name, device.id);
+          console.log('Manufacturer data:', device.manufacturerData);
           
           setDiscoveredDevices(prev => {
             const exists = prev.find(d => d.id === device.id);
@@ -155,8 +162,9 @@ export default function App() {
                 ...prev,
                 {
                   id: device.id,
-                  name: device.localName ?? undefined,
+                  name: device.localName ?? device.name ?? undefined,
                   rssi: device.rssi ?? undefined,
+                  bleDevice: device,
                 }
               ];
             }
@@ -199,16 +207,21 @@ export default function App() {
       
       const connectedDevice = await bleManager.connectToDevice(device.id);
       console.log('Connected device:', connectedDevice);
-      await connectedDevice.discoverAllServicesAndCharacteristics();
       
-      setConnectedDevices(prev => [...prev, device]);
+      // Discover services and characteristics
+      const deviceWithServices = await connectedDevice.discoverAllServicesAndCharacteristics();
+      console.log('Services discovered');
       
-      Alert.alert('Success', `Connected to ${device.name}`);
+      // Update the device with the connected BLE device
+      const updatedDevice = { ...device, bleDevice: deviceWithServices };
+      setConnectedDevices(prev => [...prev, updatedDevice]);
+      
+      Alert.alert('Success', `Connected to ${device.name || 'Unknown Device'}`);
       console.log('Connected to:', device.name);
       
     } catch (error) {
       console.error('Connection error:', error);
-      Alert.alert('Connection Error', `Failed to connect to ${device.name}`);
+      Alert.alert('Connection Error', `Failed to connect to ${device.name || 'Unknown Device'}`);
     }
   };
 
@@ -217,12 +230,82 @@ export default function App() {
       await bleManager.cancelDeviceConnection(device.id);
       setConnectedDevices(prev => prev.filter(d => d.id !== device.id));
       
-      Alert.alert('Disconnected', `Disconnected from ${device.name}`);
+      Alert.alert('Disconnected', `Disconnected from ${device.name || 'Unknown Device'}`);
       console.log('Disconnected from:', device.name);
       
     } catch (error) {
       console.error('Disconnect error:', error);
-      Alert.alert('Disconnect Error', `Failed to disconnect from ${device.name}`);
+      Alert.alert('Disconnect Error', `Failed to disconnect from ${device.name || 'Unknown Device'}`);
+    }
+  };
+
+  const sendDataToDevice = async (device: Device) => {
+    if (!device.bleDevice || !_data) {
+      Alert.alert('Error', 'No data to send or device not properly connected');
+      return;
+    }
+
+    try {
+      console.log('Sending data to device:', device.name, 'Data:', _data);
+      
+      // Get services from the connected device
+      const services = await device.bleDevice.services();
+      console.log('Available services:', services.map(s => s.uuid));
+      
+      // Try to find a writable characteristic
+      let foundCharacteristic: Characteristic | null = null;
+      
+      for (const service of services) {
+        const characteristics = await service.characteristics();
+        for (const char of characteristics) {
+          // Look for a characteristic that supports writing
+          if (char.isWritableWithResponse || char.isWritableWithoutResponse) {
+            foundCharacteristic = char;
+            console.log('Found writable characteristic:', char.uuid);
+            break;
+          }
+        }
+        if (foundCharacteristic) break;
+      }
+      
+      if (!foundCharacteristic) {
+        Alert.alert('Error', 'No writable characteristic found on this device');
+        return;
+      }
+      
+      // Convert data to base64 for transmission
+      const dataToSend = new TextEncoder().encode(_data);
+      const base64Data = btoa(String.fromCharCode(...dataToSend));
+      
+      // Write the data to the characteristic
+      await foundCharacteristic.writeWithResponse(base64Data);
+      
+      Alert.alert('Success', `Data "${_data}" sent to ${device.name || 'Unknown Device'}`);
+      console.log('Data sent successfully');
+      
+    } catch (error) {
+      console.error('Error sending data:', error);
+      Alert.alert('Send Error', `Failed to send data: ${error.message}`);
+    }
+  };
+
+  const updateBroadcastData = async () => {
+    try {
+      console.log('Updating broadcast data:', _data);
+      
+      if (isBroadcasting) {
+        await stopBroadcasting();
+        setTimeout(() => {
+          startBroadcasting();
+        }, 500);
+      } else {
+        await startBroadcasting();
+      }
+      
+      Alert.alert('Success', 'Broadcast data updated successfully');
+    } catch (error) {
+      console.error('Error updating broadcast data:', error);
+      Alert.alert('Error', 'Failed to update broadcast data');
     }
   };
 
@@ -261,12 +344,20 @@ export default function App() {
         <Text style={styles.deviceName}>{item.name || 'Connected Device'}</Text>
         <Text style={styles.deviceId}>{item.id}</Text>
       </View>
-      <Pressable
-        style={styles.disconnectButton}
-        onPress={() => disconnectFromDevice(item)}
-      >
-        <Text style={styles.buttonText}>Disconnect</Text>
-      </Pressable>
+      <View style={styles.deviceActions}>
+        <Pressable
+          style={styles.sendButton}
+          onPress={() => sendDataToDevice(item)}
+        >
+          <Text style={styles.buttonText}>Send Data</Text>
+        </Pressable>
+        <Pressable
+          style={styles.disconnectButton}
+          onPress={() => disconnectFromDevice(item)}
+        >
+          <Text style={styles.buttonText}>Disconnect</Text>
+        </Pressable>
+      </View>
     </View>
   );
 
@@ -288,6 +379,25 @@ export default function App() {
             {isScanning ? 'ON' : 'OFF'}
           </Text>
         </View>
+      </View>
+
+      {/* Data Input Section */}
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Data to Send/Broadcast</Text>
+        <TextInput 
+          value={_data}
+          onChangeText={setData}
+          placeholder="Enter data to send"
+          style={styles.textInput}
+          maxLength={50}
+        />
+        <Text style={styles.dataInfo}>Current data: "{_data}" ({_data.length}/50 chars)</Text>
+        <Pressable
+          style={[styles.controlButton, { backgroundColor: '#FF9800' }]}
+          onPress={updateBroadcastData}
+        >
+          <Text style={styles.buttonText}>Update Broadcast Data</Text>
+        </Pressable>
       </View>
 
       {/* Control Buttons */}
@@ -396,6 +506,21 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     color: '#333',
   },
+  textInput: {
+    borderWidth: 1,
+    borderColor: '#ddd',
+    padding: 12,
+    borderRadius: 8,
+    backgroundColor: 'white',
+    fontSize: 16,
+    marginBottom: 8,
+  },
+  dataInfo: {
+    fontSize: 12,
+    color: '#666',
+    marginBottom: 10,
+    fontStyle: 'italic',
+  },
   deviceList: {
     maxHeight: 150,
   },
@@ -410,6 +535,10 @@ const styles = StyleSheet.create({
   },
   deviceInfo: {
     flex: 1,
+  },
+  deviceActions: {
+    flexDirection: 'row',
+    gap: 8,
   },
   deviceName: {
     fontSize: 16,
@@ -428,6 +557,11 @@ const styles = StyleSheet.create({
     padding: 8,
     borderRadius: 5,
   },
+  sendButton: {
+    backgroundColor: '#2196F3',
+    padding: 8,
+    borderRadius: 5,
+  },
   disconnectButton: {
     backgroundColor: '#F44336',
     padding: 8,
@@ -437,6 +571,7 @@ const styles = StyleSheet.create({
     color: 'white',
     textAlign: 'center',
     fontWeight: 'bold',
+    fontSize: 12,
   },
   emptyText: {
     textAlign: 'center',
